@@ -15,31 +15,35 @@
 #include <SimpleKalmanFilter.h>
 
 /*Debugging*/
-#define DEBUG true 
+#define DEBUG false 
 #define DEBUG_SERIAL if(DEBUG)Serial
 
-#define TIMER_LIMIT 5000
+#define TIMER_LIMIT 3000
 #define SERVO_OPEN_POS 180
 #define SERVO_CLOSED_POS 0
+#define ACCEL_START_THRESHOLD 2
+#define ACCEL_LANDED_THRESHOLD 0.7
+#define APOGE_THRESHOLD 0.2
+
+#define OVERSAMPLING 4
 #define OLED_RESET     -1 // Reset pin # (or -1 if sharing Arduino reset pin)
 #define SCREEN_ADDRESS 0x3C
 #define PIN_SPI_SS    (17)
 #define SERVO_PIN 0
-#define chipSelect D4
-#define oversampling 4
+#define CHIPSELECT D4
 
 
 Adafruit_SSD1306 display(OLED_RESET);
 LOLIN_HP303B PressureSensor;
 Adafruit_MPU6050 AccelerationSensor;
 
-File last_apogee_file;
-File flight_history_file;
+File last_apogee_file, flight_history_file, index_file;
+
 SimpleKalmanFilter pressureKalmanFilter(1, 1, 0.01);
 SimpleKalmanFilter accelerationtKalmanFilter(1, 1, 0.03);
 Servo release_door_servo;
 
-enum { STATE_DISPLAY = 0, STATE_IDLE = 1, STATE_LAUNCHED = 2, STATE_APOGE = 3, STATE_LANDED=4};
+enum { STATE_DISPLAY = 0, STATE_IDLE = 1, STATE_LAUNCHED = 2, STATE_APOGE = 3, STATE_DESCENT = 4, STATE_LANDED = 5};
 long temperature;
 float altitude_ref = 0;
 float apoge=0.;
@@ -47,14 +51,14 @@ float corrected_altitude, corrected_elevation, current_acceleration, current_ele
 float acceleration_ref=0;
 int32_t pressure;
 int16_t ret;
-int state, tmp, servo_timer;
-String line;
+int state, tmp, servo_timer=0;
+String line, flight_index;
 sensors_event_t a, g, temp;
 
 
 float get_asl_altitude()
 {
-  ret = PressureSensor.measurePressureOnce(pressure, oversampling);
+  ret = PressureSensor.measurePressureOnce(pressure, OVERSAMPLING);
   if (ret != 0)
   {
     return -999;
@@ -65,7 +69,6 @@ float get_asl_altitude()
     return pressureKalmanFilter.updateEstimate(44330.0*(1.0-pow(pressure/101325.0,1.0/5.255)));
   }
 }
-
 
 void display_state(int state){
   display.clearDisplay();
@@ -113,7 +116,7 @@ void setup()
   // SD card initialization
   DEBUG_SERIAL.println("");
   DEBUG_SERIAL.print("SD card initialization.... ");
-  if (!SD.begin(chipSelect)) {
+  if (!SD.begin(CHIPSELECT)) {
     DEBUG_SERIAL.println("Failed !");
     return;
   }
@@ -139,26 +142,65 @@ void setup()
   AccelerationSensor.setGyroRange(MPU6050_RANGE_500_DEG);
   AccelerationSensor.setFilterBandwidth(MPU6050_BAND_21_HZ);
 
+  // Acceleration calibration
+  DEBUG_SERIAL.print("Accel calibration.... ");
   AccelerationSensor.getEvent(&a, &g, &temp);
   for (int i = 0; i <= 50; i += 1) {
-      // goes from 0 degrees to 180 degrees
-    acceleration_ref = acceleration_ref + sqrt(sq(a.acceleration.x) + sq(a.acceleration.y) + sq(a.acceleration.z));
-    delay(15);           // waits 15ms for the servo to reach the position
+    current_acceleration = sqrt(sq(a.acceleration.x) + sq(a.acceleration.y) + sq(a.acceleration.z));
+    acceleration_ref = acceleration_ref + current_acceleration;
+    delay(15);
   }
   acceleration_ref = acceleration_ref/51.;
 
+  for (int i = 0; i <= 50; i += 1) {
+    current_acceleration = sqrt(sq(a.acceleration.x) + sq(a.acceleration.y) + sq(a.acceleration.z))-acceleration_ref;
+    current_acceleration = accelerationtKalmanFilter.updateEstimate(current_acceleration);
+  }
+  DEBUG_SERIAL.println("OK");
+
+  // Reading file index
+  DEBUG_SERIAL.print("File Index reading.... ");
+  index_file = SD.open("index.txt");
+    if (index_file) {
+      while (index_file.available()) {
+        flight_index = index_file.readStringUntil('\n');
+      }
+      index_file.close();
+      DEBUG_SERIAL.println("OK");
+    } else {
+      DEBUG_SERIAL.println("Failed !");
+    }
+  
   // State machine initialization
-  state = STATE_DISPLAY;  
+  state = STATE_DISPLAY;
+
 }
 
 
 void loop()
 { 
+  // Open history file the first time
+  if (!flight_history_file) {
+    flight_history_file = SD.open("hist_" + String(flight_index.toInt()) + ".csv", FILE_WRITE);
+    flight_history_file.println("time;state;acc_kal;alt_kal");
+    DEBUG_SERIAL.println("print header");  
+    if (!flight_history_file) {
+      DEBUG_SERIAL.println("erro reading flight history file");  
+    }
+  }
+
   AccelerationSensor.getEvent(&a, &g, &temp);
   
-  current_acceleration = sqrt(sq(a.acceleration.x) + sq(a.acceleration.y) + sq(a.acceleration.z))-acceleration_ref;
-  corrected_elevation =  get_asl_altitude() - altitude_ref;
+  current_acceleration = abs(sqrt(sq(a.acceleration.x) + sq(a.acceleration.y) + sq(a.acceleration.z))-acceleration_ref);
+  current_acceleration = accelerationtKalmanFilter.updateEstimate(current_acceleration);
   
+  corrected_elevation =  get_asl_altitude() - altitude_ref;
+
+  if (state > STATE_IDLE) {
+    flight_history_file.println(String(millis()-servo_timer)+";"+String(state)+";"+String(current_acceleration)+";"+String(corrected_elevation));
+  }
+
+
   switch (state) {
 
     case STATE_DISPLAY:
@@ -182,10 +224,9 @@ void loop()
     case STATE_IDLE:
       DEBUG_SERIAL.println("state IDLE");
       DEBUG_SERIAL.print("linear accel: ");
-      DEBUG_SERIAL.print(current_acceleration);
-      DEBUG_SERIAL.print("  ");
-      DEBUG_SERIAL.print(accelerationtKalmanFilter.updateEstimate(current_acceleration));
-      if (current_acceleration < 10.) {
+      DEBUG_SERIAL.println(current_acceleration);
+    
+      if (current_acceleration < ACCEL_START_THRESHOLD) {
         // keep current pressure as reference, avoid elevation driffting
         altitude_ref = get_asl_altitude();
       } else {
@@ -199,9 +240,9 @@ void loop()
       DEBUG_SERIAL.println("state LAUNCHED");
       if (corrected_elevation >apoge) {
           apoge=corrected_elevation;
-          DEBUG_SERIAL.print("elevation: ");
-          DEBUG_SERIAL.println(current_acceleration);
-      } else if (corrected_elevation<apoge-1) {
+          //DEBUG_SERIAL.print("elevation: ");
+          //DEBUG_SERIAL.println(current_acceleration);
+      } else if (corrected_elevation<apoge-APOGE_THRESHOLD) {
         DEBUG_SERIAL.println("apoge reach, going to state apoge");
         state = STATE_APOGE;
       } 
@@ -216,8 +257,7 @@ void loop()
     case STATE_APOGE:
       DEBUG_SERIAL.println("state APOGE");
       release_door_servo.write(SERVO_OPEN_POS);
-      delay(1000);
-      release_door_servo.write(SERVO_CLOSED_POS);
+
       
       last_apogee_file = SD.open("apogee.txt", FILE_WRITE);
       if (last_apogee_file) {
@@ -226,21 +266,32 @@ void loop()
       } else {
         DEBUG_SERIAL.println("error opening apogee.txt");
       }
-      state = STATE_LANDED;
+      state = STATE_DESCENT;
+      break;
+    
+
+    case STATE_DESCENT:
+      if ((millis()-servo_timer>300*1000) | ((current_acceleration < 0.7))  ) {
+        DEBUG_SERIAL.println("go to landed");
+        state = STATE_LANDED;
+      }
       break;
 
 
-    case STATE_LANDED:
-      display.clearDisplay();
-      display.setTextSize(2);      // Normal 1:1 pixel scale
-      display.setCursor(0, 0);     // Start at top-left corner
-      display.println("Landed:");
-      display.println("shutdown..");
-      display.display();
+    case STATE_LANDED: 
+      flight_history_file.close();  
+      SD.remove("index.txt"); 
+      index_file = SD.open("index.txt", FILE_WRITE);
+      index_file.println(String(flight_index.toInt()+1));
+      index_file.close();
+      
+      release_door_servo.write(SERVO_CLOSED_POS);
+
       delay(1000);
       ESP.deepSleep(0);
 
       break;
+
   }
 
 }
