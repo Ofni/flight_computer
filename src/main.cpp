@@ -18,7 +18,7 @@
 #define DEBUG false 
 #define DEBUG_SERIAL if(DEBUG)Serial
 
-#define TIMER_LIMIT 3000
+#define TIMER_LIMIT 5000
 #define SERVO_OPEN_POS 180
 #define SERVO_CLOSED_POS 0
 #define ACCEL_START_THRESHOLD 2
