@@ -18,11 +18,12 @@
 #define DEBUG false 
 #define DEBUG_SERIAL if(DEBUG)Serial
 
-#define TIMER_LIMIT 5000
+#define TIMER_LIMIT 7000
 #define SERVO_OPEN_POS 180
 #define SERVO_CLOSED_POS 0
 #define ACCEL_START_THRESHOLD 2
-#define ACCEL_LANDED_THRESHOLD 0.7
+#define ACCEL_LANDED_THRESHOLD_MIN 0.7
+#define ACCEL_LANDED_THRESHOLD_MAX 1.5
 #define APOGE_THRESHOLD 0.2
 
 #define OVERSAMPLING 4
@@ -271,7 +272,7 @@ void loop()
     
 
     case STATE_DESCENT:
-      if ((millis()-servo_timer>300*1000) | ((current_acceleration < 0.7))  ) {
+      if ((millis()-servo_timer>180*1000) | ((current_acceleration < ACCEL_LANDED_THRESHOLD_MIN)) ) {
         DEBUG_SERIAL.println("go to landed");
         state = STATE_LANDED;
       }
