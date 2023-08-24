@@ -18,11 +18,13 @@
 #define DEBUG false 
 #define DEBUG_SERIAL if(DEBUG)Serial
 
-#define TIMER_LIMIT 7000
+#define TIMER_LIMIT 8000
+#define MAX_FLIGHT_TIMER_LIMIT 240 //in second
 #define SERVO_OPEN_POS 180
 #define SERVO_CLOSED_POS 0
-#define ACCEL_START_THRESHOLD 2
-#define ACCEL_LANDED_THRESHOLD_MIN 0.7
+#define ACCEL_START_THRESHOLD 3
+#define ACCEL_LANDED_THRESHOLD 0.5
+#define ACCEL_LANDED_THRESHOLD_MIN 0.5
 #define ACCEL_LANDED_THRESHOLD_MAX 1.5
 #define APOGE_THRESHOLD 0.2
 
@@ -48,7 +50,9 @@ enum { STATE_DISPLAY = 0, STATE_IDLE = 1, STATE_LAUNCHED = 2, STATE_APOGE = 3, S
 long temperature;
 float altitude_ref = 0;
 float apoge=0.;
-float corrected_altitude, corrected_elevation, current_acceleration, current_elevation ;
+float corrected_altitude, current_altitude, corrected_elevation, raw_corrected_elevation, current_acceleration,raw_current_acceleration, current_elevation ;
+float raw_acc_x, raw_acc_y, raw_acc_z;
+float raw_gyro_x, raw_gyro_y, raw_gyro_z;
 float acceleration_ref=0;
 int32_t pressure;
 int16_t ret;
@@ -66,10 +70,11 @@ float get_asl_altitude()
   }
   else
   { 
-    //return 44330.0*(1.0-pow(pressure/101325.0,1.0/5.255));
-    return pressureKalmanFilter.updateEstimate(44330.0*(1.0-pow(pressure/101325.0,1.0/5.255)));
+    return 44330.0*(1.0-pow(pressure/101325.0,1.0/5.255));
+    //return pressureKalmanFilter.updateEstimate(44330.0*(1.0-pow(pressure/101325.0,1.0/5.255)));
   }
 }
+
 
 void display_state(int state){
   display.clearDisplay();
@@ -133,6 +138,7 @@ void setup()
 
   // MPU initialization
   DEBUG_SERIAL.print("MPU initialization.... ");
+  delay(100);
   if (!AccelerationSensor.begin()) {
     DEBUG_SERIAL.print("Failed !");
     return;
@@ -141,19 +147,20 @@ void setup()
   
   AccelerationSensor.setAccelerometerRange(MPU6050_RANGE_8_G);
   AccelerationSensor.setGyroRange(MPU6050_RANGE_500_DEG);
-  AccelerationSensor.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  AccelerationSensor.setFilterBandwidth(MPU6050_BAND_44_HZ);
+  AccelerationSensor.setTemperatureStandby(true);
 
   // Acceleration calibration
   DEBUG_SERIAL.print("Accel calibration.... ");
-  AccelerationSensor.getEvent(&a, &g, &temp);
-  for (int i = 0; i <= 50; i += 1) {
+  for (int i = 0; i <= 250; i += 1) {
+    AccelerationSensor.getEvent(&a, &g, &temp);
     current_acceleration = sqrt(sq(a.acceleration.x) + sq(a.acceleration.y) + sq(a.acceleration.z));
     acceleration_ref = acceleration_ref + current_acceleration;
-    delay(15);
   }
-  acceleration_ref = acceleration_ref/51.;
+  acceleration_ref = acceleration_ref/251.;
 
-  for (int i = 0; i <= 50; i += 1) {
+  for (int i = 0; i <= 100; i += 1) {
+    AccelerationSensor.getEvent(&a, &g, &temp);
     current_acceleration = sqrt(sq(a.acceleration.x) + sq(a.acceleration.y) + sq(a.acceleration.z))-acceleration_ref;
     current_acceleration = accelerationtKalmanFilter.updateEstimate(current_acceleration);
   }
@@ -183,7 +190,8 @@ void loop()
   // Open history file the first time
   if (!flight_history_file) {
     flight_history_file = SD.open("hist_" + String(flight_index.toInt()) + ".csv", FILE_WRITE);
-    flight_history_file.println("time;state;acc_kal;alt_kal");
+    flight_history_file.println("accel ref;"+String(acceleration_ref));
+    flight_history_file.println("time(s);state;acc_kal(m/s2);raw_acc(m/s2);x_raw_acc(m/s2);y_raw_acc(m/s2);z_raw_acc(m/s2);alt_kal(m);raw_alt(m);x_raw_gyro(rad/s2);y_raw_gyro(rad/s2);z_raw_gyro(rad/s2);");
     DEBUG_SERIAL.println("print header");  
     if (!flight_history_file) {
       DEBUG_SERIAL.println("erro reading flight history file");  
@@ -192,13 +200,24 @@ void loop()
 
   AccelerationSensor.getEvent(&a, &g, &temp);
   
-  current_acceleration = abs(sqrt(sq(a.acceleration.x) + sq(a.acceleration.y) + sq(a.acceleration.z))-acceleration_ref);
-  current_acceleration = accelerationtKalmanFilter.updateEstimate(current_acceleration);
+  raw_acc_x = a.acceleration.x;
+  raw_acc_y = a.acceleration.y;
+  raw_acc_z = a.acceleration.z;
   
-  corrected_elevation =  get_asl_altitude() - altitude_ref;
+  raw_gyro_x = g.gyro.x;
+  raw_gyro_y = g.gyro.y;
+  raw_gyro_z = g.gyro.z;
+
+  raw_current_acceleration = sqrt(sq(raw_acc_x) + sq(raw_acc_y) + sq(raw_acc_z))-acceleration_ref;
+  current_acceleration = accelerationtKalmanFilter.updateEstimate(raw_current_acceleration);
+  
+  current_altitude = get_asl_altitude();
+  corrected_elevation =  pressureKalmanFilter.updateEstimate(current_altitude) - altitude_ref;
+  
+  raw_corrected_elevation = current_altitude - altitude_ref;
 
   if (state > STATE_IDLE) {
-    flight_history_file.println(String(millis()-servo_timer)+";"+String(state)+";"+String(current_acceleration)+";"+String(corrected_elevation));
+    flight_history_file.println(String((millis()-servo_timer)/1000.)+";"+String(state)+";"+String(current_acceleration)+";"+String(raw_current_acceleration)+";"+String(raw_acc_x)+";"+String(raw_acc_y)+";"+String(raw_acc_z)+";"+String(corrected_elevation)+";"+String(raw_corrected_elevation)+";"+String(raw_gyro_x)+";"+String(raw_gyro_y)+";"+String(raw_gyro_z));
   }
 
 
@@ -226,10 +245,11 @@ void loop()
       DEBUG_SERIAL.println("state IDLE");
       DEBUG_SERIAL.print("linear accel: ");
       DEBUG_SERIAL.println(current_acceleration);
-    
+
       if (current_acceleration < ACCEL_START_THRESHOLD) {
         // keep current pressure as reference, avoid elevation driffting
-        altitude_ref = get_asl_altitude();
+        altitude_ref = pressureKalmanFilter.updateEstimate(get_asl_altitude());
+
       } else {
         servo_timer = millis();
         state = STATE_LAUNCHED;
@@ -258,7 +278,6 @@ void loop()
     case STATE_APOGE:
       DEBUG_SERIAL.println("state APOGE");
       release_door_servo.write(SERVO_OPEN_POS);
-
       
       last_apogee_file = SD.open("apogee.txt", FILE_WRITE);
       if (last_apogee_file) {
@@ -272,22 +291,27 @@ void loop()
     
 
     case STATE_DESCENT:
-      if ((millis()-servo_timer>180*1000) | ((current_acceleration < ACCEL_LANDED_THRESHOLD_MIN)) ) {
+      DEBUG_SERIAL.println("state DESCENT");
+      if ((millis()-servo_timer>MAX_FLIGHT_TIMER_LIMIT*1000) | ((current_acceleration < ACCEL_LANDED_THRESHOLD_MIN)) ) {
         DEBUG_SERIAL.println("go to landed");
         state = STATE_LANDED;
       }
+      state = STATE_LANDED;
       break;
 
 
     case STATE_LANDED: 
+      DEBUG_SERIAL.println("state LANDED");
       flight_history_file.close();  
       SD.remove("index.txt"); 
       index_file = SD.open("index.txt", FILE_WRITE);
       index_file.println(String(flight_index.toInt()+1));
       index_file.close();
       
+      delay(500);
       release_door_servo.write(SERVO_CLOSED_POS);
-
+      delay(500);
+      AccelerationSensor.enableSleep(true);
       delay(1000);
       ESP.deepSleep(0);
 
